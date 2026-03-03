@@ -1,184 +1,139 @@
-# SSM-Based Private Asset NAV Nowcasting
+# SSM Private Equity NAV Nowcasting
 
-A high-performance Go implementation of State-Space Model (SSM) nowcasting for private asset Net Asset Values, adapted from the methodology of [Brown, Ghysels & Gredil (2022)](#references) and re-engineered for live portfolio monitoring of illiquid assets using publicly traded proxies.
+A production-grade Go implementation of the state-space model (SSM) for nowcasting private equity fund net asset values (NAV) at weekly frequency.
 
-## Motivation
+Based on: **Brown, Ghysels & Gredil (2022)** — *"Nowcasting Net-Asset-Values: The Case of Private Equity"*, SSRN 3507873.
 
-Institutional portfolios holding private assets—private equity, private credit, real estate, infrastructure—face a persistent problem: reported NAVs arrive quarterly, with multi-week delays, and carry appraisal smoothing bias. Between reporting dates, investors are effectively blind to the true mark-to-market exposure of a significant share of their portfolio.
+## Overview
 
-This project produces **weekly unsmoothed NAV estimates** for each private asset by fusing sparse quarterly NAV reports with high-frequency returns from matched exchange-traded proxies (ETPs) and market indices. The output is a panel of weekly log-returns suitable for risk attribution, allocation rebalancing, and regulatory reporting.
+Private equity funds report NAV quarterly with significant lags. This model uses a 4-state Kalman filter to estimate weekly unsmoothed NAV by combining:
 
-## Methodological Foundation
+- **Quarterly NAV reports** (sparse, lagged, smoothed)
+- **Public market index returns** (weekly, systematic risk)
+- **Comparable ETP returns** (weekly, idiosyncratic signal)
+- **GARCH(1,1) conditional variance** from proxy residuals
 
-The core insight, due to Brown, Ghysels & Gredil (BGG), is that a private fund's true asset value can be modelled as a **latent state** in a linear Gaussian SSM, with two distinct observation channels:
+The model jointly estimates NAV smoothing intensity (λ), systematic risk (β), idiosyncratic volatility (F), and other parameters via maximum-likelihood with L-BFGS and complex-step analytic gradients.
 
-1. **Quarterly NAV reports** — informative but smoothed and delayed.
-2. **Comparable public asset returns** — available at high frequency but only partially correlated with the fund.
-
-A Kalman filter optimally blends these two signals, weighting each by its estimated precision, to extract the unobservable true NAV path at the weekly frequency. See `docs/ssrn-3507873.pdf` for the full treatment.
-
-## Adaptations from the Original Paper
-
-This implementation departs from BGG in several deliberate ways, motivated by the practical requirements of a live portfolio system where fund-level cash flow data may not be available.
-
-### 1. ETP-Based Comparable Assets (vs. Industry Benchmarks)
-
-**BGG** matches each PE fund to a Fama-French 12 industry portfolio as the comparable asset.
-
-**This implementation** matches each private asset to a specific exchange-traded product (ETP) — typically an ETF tracking the relevant sub-sector, geography, or strategy — paired with a broad market index.
-
-**Rationale.** ETPs capture finer cross-sectional variation in risk exposures than broad industry portfolios. A European mid-cap infrastructure fund, for instance, is better proxied by a dedicated infrastructure ETF than by the FF "Utilities" bucket. The mapping table (`inputs/etp_and_index_mapping_table.csv`) makes this pairing explicit and auditable per asset.
-
-### 2. NAV-Level State Vector (vs. Cumulative Returns)
-
-**BGG** defines the latent state as the fund's cumulative log-return from inception, with a separate mapping function *M_t* converting between returns and asset values that must be iteratively re-estimated.
-
-**This implementation** works directly in **log-NAV levels** with a four-dimensional state:
-
-| State | Description |
-|-------|-------------|
-| η_t | Weekly idiosyncratic log-return shock |
-| v\*_t | True (unsmoothed) log-NAV level |
-| m_t | Reported (smoothed) log-NAV level |
-| d_t | Distribution-intensity state |
-
-**Rationale.** Operating in NAV levels eliminates the need for the iterative return-to-value mapping loop (BGG Section 3.3.1, Appendix A.2.1), which is a potential source of convergence issues and computational cost. The level parameterisation also simplifies the NAV-anchoring step (see §4 below), since the filter state is directly comparable to observed NAVs without back-transforming through *M_t*. The trade-off is a mild loss of structural interpretability for the cumulative-return decomposition, which is acceptable when the primary deliverable is a NAV time series rather than fund-level risk attribution.
-
-### 3. OLS-Fixed (α, β) with Full MLE on Remaining Parameters
-
-**BGG** profiles α and β on a 15×15 grid (225 evaluations), penalises via a PME-based pricing-error criterion, and iterates the remaining 8 parameters to convergence.
-
-**This implementation** fixes α and β to their rolling OLS estimates from the comparable-asset regression over the calibration window, then runs **unconstrained L-BFGS** on the remaining 8-parameter vector {β_c, ψ_c, F, σ_nav, F_c, λ, δ, σ_d} in a single pass.
-
-**Rationale.** The grid-profile approach is designed for settings where α and β are weakly identified from sparse cash-flow data. In our setting, the comparable-asset return series is observed weekly, so the OLS regression of proxy returns on the market index provides a well-identified and stable estimate of the systematic risk loading. Fixing (α, β) at these values avoids the combinatorial cost of the 225-point grid and focuses the optimiser's budget on the parameters that are genuinely hard to identify from quarterly NAV data — principally λ (smoothing intensity), F (idiosyncratic volatility scale), and σ_nav (reporting noise). In practice, this reduces per-asset estimation time by roughly an order of magnitude, enabling the full panel to be processed in seconds.
-
-### 4. NAV Anchoring
-
-**BGG** does not anchor filtered states to observed NAVs; the model output is self-consistent by construction via the return-to-value mapping.
-
-**This implementation** applies a **level shift** to the smoothed state trajectory so that it passes through the most recent observed NAV at the boundary of the evaluation window.
-
-**Rationale.** For portfolio reporting, it is essential that the nowcasted NAV series is consistent with the last audited figure. Without anchoring, numerical drift in the Kalman smoother can produce a level offset that, while statistically harmless for return estimation, creates an unexplainable discrepancy in reported portfolio value. The shift is applied uniformly across all time steps, preserving the return dynamics extracted by the filter.
-
-### 5. Complex-Step Gradient Computation
-
-**BGG** uses numerical Hessians (Miranda & Fackler, 2004) for standard errors but does not discuss gradient computation for the optimiser.
-
-**This implementation** computes exact gradients via the **complex-step method**: each parameter is perturbed by iε in the complex plane, and the gradient is recovered as Im[f(θ + iε)] / ε. The entire Kalman filter NLL is implemented in both `float64` and `complex128` arithmetic for this purpose.
-
-**Rationale.** The complex-step derivative is analytically exact to machine precision (no finite-difference truncation error) and requires no step-size tuning. This makes the L-BFGS optimiser substantially more robust on the ill-conditioned likelihood surfaces typical of sparse-data SSMs, where finite-difference gradients often trigger premature convergence or line-search failures.
-
-### 6. No Cash-Flow or Distribution Data Required
-
-**BGG** jointly models fund distributions and NAV reports, using the distribution channel to identify the smoothing function and the return-to-value mapping.
-
-**This implementation** treats the distribution-intensity state *d_t* as latent rather than observed.
-
-**Rationale.** Fund-level cash-flow data (capital calls, distributions) is frequently unavailable to the LP's risk team in a timely, machine-readable format. By relying solely on quarterly NAVs and the public proxy, this system can be deployed without waiting for cash-flow reconciliation. The distribution state is still present in the model to absorb low-frequency mean shifts in the comparable-asset relationship, but it is estimated from the NAV and proxy data alone, which is sufficient when the primary goal is NAV nowcasting rather than fund-level parameter recovery.
-
-### 7. Outer Fixed-Point Loop for β_c
-
-**BGG** estimates the comparable-asset parameters (β_c, ψ, F_c) jointly with the fund parameters inside the Kalman MLE.
-
-**This implementation** wraps the MLE in an **outer fixed-point iteration** over β_c, the proxy-to-fund return loading. At each outer step, the proxy return series is adjusted for the current β_c estimate before the inner optimisation is run.
-
-**Rationale.** β_c enters the observation equation nonlinearly (it scales the Kalman innovation for the comparable-return channel and simultaneously appears in the proxy-adjustment formula involving the market return lead). Iterating over β_c in an outer loop avoids the ill-conditioning that arises when the optimiser must simultaneously navigate the likelihood surface over β_c and the smoothing/noise parameters. Convergence is typically achieved in 2–3 outer iterations.
-
-## Architecture
+## Project Structure
 
 ```
 ssm_go_project/
-├── cmd/ssm/main.go              # CLI entry point, parallel orchestration
+├── cmd/
+│   └── ssm/
+│       └── main.go              # Entry point, CLI, parallel orchestration
 ├── internal/
-│   ├── config/config.go         # Constants, bounds, environment config
-│   ├── csvio/                   # CSV I/O and weekly resampling
-│   ├── garch/garch.go           # GARCH(1,1) MLE for conditional variance
+│   ├── config/
+│   │   └── config.go            # Constants, bounds, env configuration
+│   ├── csvio/
+│   │   ├── reader.go            # CSV parsing, weekly resampling
+│   │   └── writer.go            # Output CSV writing
+│   ├── mathutil/
+│   │   └── mathutil.go          # Numeric helpers, OLS, matrix ops
+│   ├── timeutil/
+│   │   └── timeutil.go          # Date parsing, weekly grids
+│   ├── garch/
+│   │   └── garch.go             # GARCH(1,1) fitting via L-BFGS
 │   ├── kalman/
-│   │   ├── filter.go            # 4-state Kalman filter (real + complex)
-│   │   └── smoother.go          # Forward filter + RTS backward smoother
-│   ├── mathutil/mathutil.go     # Numerics: OLS, 4×4 linalg, sigmoids
-│   ├── mle/estimator.go         # L-BFGS parameter estimation
-│   ├── pipeline/
-│   │   ├── prepare.go           # Data ingestion and alignment
-│   │   └── compute.go           # Per-asset SSM pipeline
-│   └── timeutil/                # Date parsing and weekly grid construction
-├── inputs/                      # Input data (CSV)
-├── outputs/                     # Generated return panels (CSV)
-├── docs/                        # Reference papers and presentations
+│   │   ├── filter.go            # Kalman NLL (real + complex-step)
+│   │   └── smoother.go          # Forward filter + RTS smoother
+│   ├── mle/
+│   │   └── estimator.go         # MLE with outer β_c fixed-point
+│   └── pipeline/
+│       ├── prepare.go           # Data loading and panel construction
+│       └── compute.go           # Per-asset SSM return computation
+├── inputs/                       # Input CSV data files
+├── outputs/                      # Generated output files
 ├── go.mod
 ├── go.sum
-└── Makefile
+├── Makefile
+└── README.md
 ```
 
-### Per-Asset Pipeline
+### Package Responsibilities
 
-For each private asset, `ComputeSSMReturns` executes:
+| Package | Role |
+|---------|------|
+| `config` | All tunable constants, parameter bounds, environment variable parsing |
+| `csvio` | CSV I/O, weekly resampling, log-return computation |
+| `mathutil` | `IsFinite`, `CleanReturnSeries`, `CleanHt`, `OLSBetaAlpha`, `Sigmoid`, bound mapping, 4×4 matrix ops |
+| `timeutil` | Date parsing, Friday-grid construction, as-of index lookup, window computation |
+| `garch` | GARCH(1,1) estimation with backcast initialisation and complex-step gradients |
+| `kalman` | 4-state Kalman filter NLL (real and complex), forward filter + RTS backward smoother |
+| `mle` | Maximum-likelihood estimation with L-BFGS, bounded parameters, outer β_c loop |
+| `pipeline` | End-to-end data preparation and per-asset SSM computation |
 
-1. **Window extraction** — Slice data to the as-of date; determine calibration and evaluation windows from the daily date grid.
-2. **Rolling OLS** — Estimate (α, β) from proxy vs. market returns over the calibration window.
-3. **MLE** — Estimate the 8-parameter θ vector via L-BFGS with complex-step gradients, iterated over the β_c fixed point.
-4. **Kalman filter + RTS smoother** — Forward-filter the full history, then backward-smooth via Rauch-Tung-Striebel to produce the latent NAV path.
-5. **NAV anchoring** — Shift the smoothed trajectory to pass through the last observed NAV.
-6. **Return extraction** — Difference the anchored log-NAV series to obtain weekly log-returns.
+## Requirements
 
-All assets are processed in parallel across available CPU cores.
+- **Go 1.22+** (tested with 1.25.1)
+- **gonum** v0.17.0 (optimisation library)
 
-## Usage
-
-### Prerequisites
-
-- Go 1.21+
-- Input CSVs in `inputs/` (see below)
-
-### Build & Run
+## Quick Start
 
 ```bash
-make run                          # default as-of date: 2025-11-14
-make run ASOF=2026-03-03          # custom as-of date
+# Build
+make build
+
+# Run with default as-of date (2025-11-14)
+make run
+
+# Run with custom date
+make run ASOF=2025-06-30
+
+# Or directly:
+go build -o ssm_go ./cmd/ssm
+SSM_ASOF_DATE=2025-11-14 ./ssm_go
 ```
 
-### Environment Variables
+## Configuration
+
+All runtime settings are controlled via environment variables:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `SSM_ASOF_DATE` | `2025-11-14` | Target nowcasting date (YYYY-MM-DD) |
-| `SSM_WORKERS` | all CPUs | Parallelism level |
-| `SSM_DEBUG` | (unset) | Enable debug logging |
+| `SSM_ASOF_DATE` | `2025-11-14` | Target valuation date |
+| `SSM_WORKERS` | `NumCPU()` | Parallel worker count |
+| `SSM_DEBUG` | *(empty)* | Enable debug logging (any non-empty value) |
 
-### Input Data
+## Input Files
+
+Place these in the `inputs/` directory:
 
 | File | Description |
 |------|-------------|
-| `private_assets_prices_quarterly_wide.csv` | Quarterly NAVs, wide format (Date × Asset) |
-| `etp_and_index_mapping_table.csv` | Asset → ETP proxy → Market index mapping |
+| `private_assets_prices_quarterly_wide.csv` | Quarterly NAV observations (date × asset wide format) |
+| `etp_and_index_mapping_table.csv` | Asset → ETP proxy → market index mapping with initial parameters |
 | `etp_proxy_idio_daily.csv` | Daily ETP proxy prices |
-| `index_prices_daily.csv` | Daily market index prices |
+| `index_prices_daily.csv` | Daily broad market index prices |
 
-### Output
+## Output
 
-`outputs/ssm_returns_<YYYY-MM-DD>.csv` — Wide-format CSV of weekly log-returns (Date × Asset) for the evaluation window ending at the as-of date.
+The model writes a single CSV to `outputs/ssm_returns_YYYY-MM-DD.csv` containing weekly log-returns for each asset within the evaluation window.
 
-## Model Parameters
+## Algorithm Summary
 
-The 8-dimensional θ vector estimated by MLE:
+For each asset at the target date:
 
-| Index | Parameter | Description | Bounds |
-|-------|-----------|-------------|--------|
-| 0 | β_c | Proxy-to-fund idiosyncratic return loading | [0.01, 3.0] |
-| 1 | ψ_c | Proxy return intercept | [−0.20, 0.20] |
-| 2 | log F | Idiosyncratic volatility scale | [log 0.3, log 4.5] |
-| 3 | log σ_nav | NAV reporting noise | [log 1e-4, log 2.0] |
-| 4 | log F_c | Proxy idiosyncratic vol. scale | [log 0.01, log 2.0] |
-| 5 | λ | NAV smoothing intensity | [0.40, 0.99] |
-| 6 | δ | Distribution AR(1) coefficient | [0.00, 0.995] |
-| 7 | log σ_d | Distribution-intensity noise | [log 1e-6, log 5.0] |
+1. **Data windowing**: Extract calibration (2000 trading days) and evaluation (500 trading days) windows
+2. **GARCH(1,1)**: Fit conditional variance on proxy residuals (proxy − β·market) with complex-step gradients
+3. **Rolling OLS**: Estimate α, β from comparable vs. market returns over the calibration window
+4. **MLE estimation**: Optimise 8 SSM parameters via L-BFGS with:
+   - Sigmoid-bounded parameter space
+   - Complex-step analytic gradients (machine-precision, no finite-difference noise)
+   - Outer fixed-point iteration for β_c (comparable-to-fund loading)
+5. **Kalman filter**: Forward pass with dual observation equations (NAV + comparable return)
+6. **RTS smoother**: Backward pass for optimal smoothed state estimates
+7. **NAV anchoring**: Shift smoothed log-NAV to match the last observed quarterly NAV before the evaluation window
+8. **Return extraction**: Compute weekly log-return differences from the anchored smoothed states
 
-## References
+## Performance Notes
 
-- **Brown, G. W., Ghysels, E., & Gredil, O. (2022).** *Nowcasting Net Asset Values: The Case of Private Equity.* Review of Financial Studies. [SSRN 3507873](https://papers.ssrn.com/sol3/papers.cfm?abstract_id=3507873). See `docs/ssrn-3507873.pdf`.
-
-Additional reference materials are available in the `docs/` folder.
+- **Parallelism**: Assets are processed concurrently with a bounded semaphore (default: all CPU cores)
+- **Memory**: Pre-allocated scratch buffers per goroutine avoid allocation pressure in the inner loop
+- **Gradients**: Complex-step differentiation provides machine-precision gradients without the instability of finite differences
+- **Matrix ops**: All 4×4 Kalman covariance operations use stack-allocated fixed-size arrays (zero heap allocation in hot path)
+- **Bound mapping**: Sigmoid transform converts bounded optimisation to unconstrained L-BFGS, matching scipy's L-BFGS-B behaviour
 
 ## License
 
-Internal use. Not for redistribution without permission.
+Internal / proprietary. Not for redistribution.
