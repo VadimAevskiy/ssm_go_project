@@ -145,7 +145,7 @@ For each asset, `ComputeSSMReturns` executes:
 
 1. **Window extraction**: slice data to the as-of date; determine calibration (~2,000 days) and evaluation (~500 days) windows.
 2. **NAV sufficiency check**: require at least 12 NAV observations; skip otherwise.
-3. **Rolling OLS**: re-estimate (alpha, beta) over the calibration window (minimum 60 pairs; fall back to full-sample).
+3. **OLS**: re-estimate (alpha, beta) over the calibration window (minimum 60 pairs; fall back to full-sample).
 4. **MLE**: estimate theta via L-BFGS with complex-step gradients.
 5. **Kalman filter + RTS smoother**: forward filter then backward smooth to produce v*_{t|T}.
 6. **NAV anchoring**: level-shift to the last observed NAV.
@@ -172,8 +172,8 @@ All assets are processed in parallel (goroutines bounded by SSM_WORKERS, default
 
 | Parameter | Source | Description |
 |-----------|--------|-------------|
-| alpha | Rolling OLS (calibration window) | Jensen's alpha of comparable on market |
-| beta | Rolling OLS (calibration window) | Market beta of comparable on market |
+| alpha | OLS (calibration window) | Jensen's alpha of comparable on market |
+| beta | OLS (calibration window) | Market beta of comparable on market |
 
 ### Initial Values
 
@@ -244,7 +244,7 @@ The model builds on Brown, Ghysels and Gredil (2022). Six design decisions depar
 
 **2. NAV-level state vector.** BGG tracks cumulative log-returns with a separate mapping function M_t converting between returns and asset values. This implementation works directly in log-NAV levels, eliminating the iterative return-to-value mapping loop (BGG Section 3.3.1, Appendix A.2.1) and simplifying NAV anchoring. The trade-off is a mild loss of interpretability for cumulative-return decomposition, acceptable when the deliverable is a NAV series.
 
-**3. OLS-fixed (alpha, beta).** BGG profiles alpha and beta on a 15x15 grid (225 evaluations) with a PME-based penalty. Here they are fixed to rolling OLS estimates from weekly proxy-on-market regressions, which are well-identified at weekly frequency. This avoids the grid cost and focuses the optimiser on the parameters genuinely hard to identify from sparse NAV data (lambda, F, sigma_nav), reducing per-asset estimation time by roughly an order of magnitude.
+**3. OLS-fixed (alpha, beta).** BGG profiles alpha and beta on a 15x15 grid (225 evaluations) with a PME-based penalty. Here they are fixed to OLS estimates from weekly proxy-on-market regressions, which are well-identified at weekly frequency. This avoids the grid cost and focuses the optimiser on the parameters genuinely hard to identify from sparse NAV data (lambda, F, sigma_nav), reducing per-asset estimation time by roughly an order of magnitude.
 
 **4. NAV anchoring.** BGG does not anchor filtered states; the output is self-consistent via the return-to-value mapping. This implementation applies a uniform level shift so the smoothed trajectory passes through the last audited NAV, ensuring consistency in portfolio reporting without affecting estimated returns.
 
